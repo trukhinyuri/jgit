@@ -33,6 +33,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.jgit.errors.PackMismatchException;
+import org.eclipse.jgit.errors.SearchForReuseTimeout;
 import org.eclipse.jgit.internal.JGitText;
 import org.eclipse.jgit.internal.storage.commitgraph.CommitGraph;
 import org.eclipse.jgit.internal.storage.pack.ObjectToPack;
@@ -525,13 +526,19 @@ public class ObjectDirectory extends FileObjectDatabase {
 
 	private void selectObjectRepresentation(PackWriter packer, ObjectToPack otp,
 			WindowCursor curs, Set<AlternateHandle.Id> skips) throws IOException {
-		packed.selectRepresentation(packer, otp, curs);
+		try {
+			packed.selectRepresentation(packer, otp, curs);
+			packer.checkSearchForReuseTimeout();
 
-		skips = addMe(skips);
-		for (AlternateHandle h : myAlternates()) {
-			if (!skips.contains(h.getId())) {
-				h.db.selectObjectRepresentation(packer, otp, curs, skips);
+			skips = addMe(skips);
+			for (AlternateHandle h : myAlternates()) {
+				if (!skips.contains(h.getId())) {
+					h.db.selectObjectRepresentation(packer, otp, curs, skips);
+					packer.checkSearchForReuseTimeout();
+				}
 			}
+		} catch (SearchForReuseTimeout e) {
+			return;
 		}
 	}
 

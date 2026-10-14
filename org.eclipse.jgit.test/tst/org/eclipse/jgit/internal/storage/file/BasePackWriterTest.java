@@ -940,6 +940,42 @@ public class BasePackWriterTest extends SampleDataRepositoryTestCase {
 		testPartialPackFilesScanWhenDoingSearchForReuseTimeoutCheck(false, expectedSelectCalls);
 	}
 
+	@Test
+	public void skipAlternatesScanWhenSearchForReuseTimeoutExceeded()
+			throws Exception {
+		FileRepository altRepo = createWorkRepository();
+		addRepoToClose(altRepo);
+		RevCommit altCommit;
+		try (Git altGit = new Git(altRepo)) {
+			altCommit = altGit.commit().setMessage("Alternate commit").call();
+			GC altGc = new GC(altRepo);
+			altGc.setPackExpireAgeMillis(0);
+			altGc.setExpireAgeMillis(0);
+			altGc.gc().get();
+		}
+
+		FileRepository mainRepo = createWorkRepository();
+		addRepoToClose(mainRepo);
+		File altFile = new File(mainRepo.getObjectDatabase().getDirectory(),
+				INFO_ALTERNATES);
+		altFile.getParentFile().mkdirs();
+		write(altFile,
+				altRepo.getObjectDatabase().getDirectory().getAbsolutePath()
+						+ "\n");
+
+		PackConfig packConfig = new PackConfig(mainRepo);
+		packConfig.setSearchForReuseTimeout(Duration.ofSeconds(-1));
+		try (PackWriter pw = new PackWriter(packConfig,
+				mainRepo.newObjectReader())) {
+			pw.enableSearchForReuseTimeout();
+			pw.preparePack(NullProgressMonitor.INSTANCE,
+					Collections.singleton(altCommit.getId()), NONE);
+			pw.writePack(NullProgressMonitor.INSTANCE,
+					NullProgressMonitor.INSTANCE, os);
+			assertEquals(0, pw.getStatistics().getReusedObjects());
+		}
+	}
+
 	@SuppressWarnings("boxing")
 	public void testPartialPackFilesScanWhenDoingSearchForReuseTimeoutCheck(
 			boolean doReturn, int expectedSelectCalls) throws Exception {

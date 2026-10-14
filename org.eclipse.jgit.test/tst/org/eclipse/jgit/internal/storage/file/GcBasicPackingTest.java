@@ -16,18 +16,26 @@ import static org.junit.Assert.assertTrue;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.internal.storage.pack.StoredObjectRepresentation;
+import org.eclipse.jgit.junit.TestRepository;
 import org.eclipse.jgit.junit.TestRepository.BranchBuilder;
 import org.eclipse.jgit.lib.ConfigConstants;
+import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.GcConfig;
 import org.eclipse.jgit.lib.GcConfig.PackRefsMode;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.RefUpdate;
+import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.revwalk.RevBlob;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.storage.file.FileBasedConfig;
 import org.eclipse.jgit.storage.pack.PackConfig;
@@ -480,5 +488,123 @@ public class GcBasicPackingTest extends GcTestCase {
 	private static void assertHasNoLooseRef(FileRepository repository)
 			throws IOException {
 		assertFalse("should have no loose ref", hasLooseRef(repository));
+	}
+
+	@Test
+	public void testGcSearchForReuseTimeoutAcrossMultiplePacks()
+			throws Exception {
+		StringBuilder base = new StringBuilder(4096);
+		for (int i = 0; i < 256; i++) {
+			base.append("0123456789abcdef");
+		}
+		RevBlob b1 = tr.blob(base + "A");
+		RevBlob b2 = tr.blob(base + "B");
+		BranchBuilder bb = tr.branch("refs/heads/master");
+		bb.commit().add("a", b1).add("b", b2).create();
+
+		// Oldest pack P1: store b1 and b2 as PACK_WHOLE without deltas.
+		PackConfig p1Config = new PackConfig(repo);
+		p1Config.setDeltaCompress(false);
+		p1Config.setReuseDeltas(false);
+		gc.setPackConfig(p1Config);
+		gc.setPackExpireAgeMillis(Long.MAX_VALUE);
+		gc.setExpireAgeMillis(Long.MAX_VALUE);
+		gc.gc().get();
+		assertEquals(1, repo.getObjectDatabase().getPacks().size());
+
+		fsTick();
+
+		// Newer pack P2: store b1 and b2 with delta compression enabled.
+		bb.commit().add("c", "c").create();
+		PackConfig p2Config = new PackConfig(repo);
+		p2Config.setDeltaCompress(true);
+		p2Config.setReuseObjects(false);
+		p2Config.setReuseDeltas(false);
+		gc.setPackConfig(p2Config);
+		gc.gc().get();
+		assertEquals(2, repo.getObjectDatabase().getPacks().size());
+
+		fsTick();
+
+		// Third GC with expired searchForReuseTimeout and deltaCompress=false:
+		// P1 (oldest) is scanned first (selecting PACK_WHOLE), then timeout
+		// aborts searchForReuse before P2's PACK_DELTA representation is reached.
+		PackConfig gcConfig = new PackConfig(repo);
+		gcConfig.setDeltaCompress(false);
+		gcConfig.setSearchForReuseTimeout(Duration.ofSeconds(-1));
+		gc.setPackConfig(gcConfig);
+		gc.setPackExpireAgeMillis(0);
+		gc.setExpireAgeMillis(0);
+		Collection<Pack> packs = gc.gc().get();
+		assertEquals(1, packs.size());
+
+		Pack resultPack = packs.iterator().next();
+		try (WindowCursor curs = (WindowCursor) repo.newObjectReader()) {
+			assertEquals(StoredObjectRepresentation.PACK_WHOLE,
+					resultPack.representation(curs, b1).getFormat());
+			assertEquals(StoredObjectRepresentation.PACK_WHOLE,
+					resultPack.representation(curs, b2).getFormat());
+		}
+	}
+
+	@Test
+	public void testGcSearchForReuseTimeoutSkipsAlternates() throws Exception {
+		FileRepository altRepo = createBareRepository();
+		StringBuilder base = new StringBuilder(4096);
+		for (int i = 0; i < 256; i++) {
+			base.append("0123456789abcdef");
+		}
+		RevBlob b1;
+		RevBlob b2;
+		RevCommit altCommit;
+		altRepo.incrementOpen();
+		try (TestRepository<Repository> altTr = new TestRepository<>(altRepo)) {
+			b1 = altTr.blob(base + "A");
+			b2 = altTr.blob(base + "B");
+			altCommit = altTr.branch("refs/heads/master").commit()
+					.add("a", b1).add("b", b2).create();
+		}
+
+		GC altGc = new GC(altRepo);
+		altGc.setPackExpireAgeMillis(0);
+		altGc.setExpireAgeMillis(0);
+		Collection<Pack> altPacks = altGc.gc().get();
+		assertEquals(1, altPacks.size());
+		Pack altPack = altPacks.iterator().next();
+		try (WindowCursor curs = (WindowCursor) altRepo.newObjectReader()) {
+			int f1 = altPack.representation(curs, b1).getFormat();
+			int f2 = altPack.representation(curs, b2).getFormat();
+			assertTrue("expected delta in alternate pack",
+					f1 == StoredObjectRepresentation.PACK_DELTA
+							|| f2 == StoredObjectRepresentation.PACK_DELTA);
+		}
+
+		File altFile = new File(repo.getObjectDatabase().getDirectory(),
+				Constants.INFO_ALTERNATES);
+		altFile.getParentFile().mkdirs();
+		Files.write(altFile.toPath(),
+				(altRepo.getObjectDatabase().getDirectory().getAbsolutePath()
+						+ "\n").getBytes(StandardCharsets.UTF_8));
+
+		RefUpdate ru = repo.updateRef("refs/heads/master");
+		ru.setNewObjectId(altCommit);
+		assertEquals(RefUpdate.Result.NEW, ru.forceUpdate());
+
+		PackConfig gcConfig = new PackConfig(repo);
+		gcConfig.setDeltaCompress(false);
+		gcConfig.setSearchForReuseTimeout(Duration.ofSeconds(-1));
+		gc.setPackConfig(gcConfig);
+		gc.setPackExpireAgeMillis(0);
+		gc.setExpireAgeMillis(0);
+		Collection<Pack> packs = gc.gc().get();
+		assertEquals(1, packs.size());
+
+		Pack resultPack = packs.iterator().next();
+		try (WindowCursor curs = (WindowCursor) repo.newObjectReader()) {
+			assertEquals(StoredObjectRepresentation.PACK_WHOLE,
+					resultPack.representation(curs, b1).getFormat());
+			assertEquals(StoredObjectRepresentation.PACK_WHOLE,
+					resultPack.representation(curs, b2).getFormat());
+		}
 	}
 }

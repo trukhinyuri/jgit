@@ -1333,6 +1333,7 @@ public class GC {
 				for (ObjectIdSet idx : excludeObjects)
 					pw.excludeObjects(idx);
 			pw.setCreateBitmaps(createBitmap);
+			pw.enableSearchForReuseTimeout();
 			pw.preparePack(pm, want, have, PackWriter.NONE,
 					union(tags, excludedRefsTips));
 			if (pw.getObjectCount() == 0)
